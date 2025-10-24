@@ -9,3 +9,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+#data
+data/concatenated_eeg/
+data/raw_eeg/

@@ -13,7 +13,6 @@ def ema_update(ema_params, model, alpha=0.95):
         lambda a, b: a * alpha + (1 - alpha) * b, ema_params, model.parameters()
     )
 
-
 @contextmanager
 def use_ema(model, ema_params):
     orig = model.parameters()
@@ -22,7 +21,6 @@ def use_ema(model, ema_params):
         yield
     finally:
         model.update(orig)
-
 
 class Trainer:
     def __init__(self, model: nn.Module, optimizer: Optimizer):
@@ -79,8 +77,9 @@ class Trainer:
             frac_halted_accum = 0.0
             avg_steps_accum = 0.0
             n_batches = 0
-
-            for batch in train:
+            
+            train_bar = tqdm(train, desc="  Training", unit="batch", leave=False)
+            for batch in train_bar:
                 batch = {k: mx.array(v) for k, v in batch.items()}
                 if (carry is None) or (
                     carry["halted"].shape[0] != batch["image"].shape[0]
