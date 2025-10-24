@@ -1,113 +1,239 @@
 # data/eeg.py
+import os
 import math
+from typing import List, Optional, Tuple, Dict
+
 import numpy as np
 import pandas as pd
 from scipy.signal import welch
 from sklearn.model_selection import StratifiedShuffleSplit
 
-class _Stream:
-    def __init__(self, X, y, bs, shuffle, seed):
-        self.X, self.y = X, y
-        self.bs = len(X) if bs == -1 else bs
-        self.shuffle, self.seed = shuffle, seed
-        self.reset()
-    def reset(self):
-        self.idx = np.arange(len(self.y))
-        if self.shuffle: np.random.default_rng(self.seed).shuffle(self.idx)
-        self.ptr = 0
-    def __iter__(self): 
-        self.reset(); 
-        return self
-    def __next__(self):
-        if self.ptr >= len(self.idx): raise StopIteration
-        j = self.idx[self.ptr:self.ptr+self.bs]; self.ptr += self.bs
-        return {"image": self.X[j], "label": self.y[j]}
-    def __len__(self):
-        return math.ceil(len(self.y) / self.bs)
 
-def _ensure_3d(X):
-    X = np.asarray(X, np.float32)
-    if X.ndim == 1: return X[None, :, None]
-    if X.ndim == 2: return X[None, :, :]
-    return X
+def _read_header_and_dims(data_path: str) -> Tuple[int, int]:
+    one = pd.read_csv(data_path, nrows=1)
+    with open(data_path, "r") as f:
+        n_total_lines = sum(1 for _ in f)
+    return max(0, n_total_lines - 1), one.shape[1]
 
-def _build_epochs(labels, data, fs=100, pre_seconds=4, channels=None):
-    if channels is None: channels = list(range(data.shape[1]))
-    win = int(pre_seconds * fs)
-    n = data.shape[0]
-    used = np.zeros(n, bool)
-    Xp, Xn = [], []
-    for i in range(len(labels)):
-        end = int(labels.iloc[i, 0]); lab = int(labels.iloc[i, 1]); start = end - win
-        if start < 0 or end > n: continue
-        seg = data.iloc[start:end, channels].to_numpy(np.float32)
-        if lab == 1: Xp.append(seg)
-        elif lab == -1: Xn.append(seg)
-        used[start:end] = True
-    Xp = np.array(Xp) if len(Xp) else np.zeros((0, win, len(channels)), np.float32)
-    Xn = np.array(Xn) if len(Xn) else np.zeros((0, win, len(channels)), np.float32)
-    Xr = []
-    step, cap, k = win, 200, 0
-    for s in range(0, n - win + 1, step):
-        if k >= cap: break
-        e = s + win
-        if not used[s:e].any():
-            Xr.append(data.iloc[s:e, channels].to_numpy(np.float32)); k += 1
-    Xr = np.array(Xr) if len(Xr) else np.zeros((0, win, len(channels)), np.float32)
-    X = np.concatenate([Xn, Xr, Xp], 0)
-    y = np.concatenate([
-        np.zeros(len(Xn), int),        # -1 → 0
-        np.ones(len(Xr), int),         # 0 → 1
-        2*np.ones(len(Xp), int)        # +1 → 2
-    ])    
-    return X, y
 
-def _psd_cube(X, fs, nperseg=None, noverlap=None, log=True, eps=1e-8):
-    X = _ensure_3d(X)
-    E, N, C = X.shape
-    if nperseg is None: nperseg = int(min(N, fs))
-    if noverlap is None: noverlap = nperseg // 2
+def _read_labels(labels_path: str) -> pd.DataFrame:
+    df = pd.read_csv(labels_path, dtype={0: np.int64, 1: np.int8})
+    df = df.iloc[:, :2]
+    df.columns = ["end", "label"]
+    df = df[df["label"].isin([-1, 1])].copy()
+    df.sort_values("end", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def _label_to01(y_raw: np.ndarray) -> np.ndarray:
+    return (y_raw.astype(np.int8) + 1) // 2
+
+
+def _epoch_slice_from_csv(
+    data_path: str,
+    start: int,
+    end: int,
+    usecols: Optional[List[int]],
+    dtype=np.float16,
+) -> np.ndarray:
+    nrows = end - start
+    if nrows <= 0:
+        raise ValueError("Invalid epoch slice: start >= end")
+    skip = range(1, start + 1) if start > 0 else None
+    df = pd.read_csv(
+        data_path,
+        dtype=dtype,
+        nrows=nrows,
+        skiprows=skip,
+        usecols=usecols,
+    )
+    return df.to_numpy(dtype=dtype, copy=False)
+
+
+def _psd_image_from_epoch(
+    epoch_tc: np.ndarray,
+    fs: int,
+    nperseg: Optional[int] = None,
+    noverlap: Optional[int] = None,
+    log: bool = True,
+    eps: float = 1e-8,
+    out_dtype=np.float16,
+) -> Tuple[np.ndarray, np.ndarray]:
+    T, C = epoch_tc.shape
+    nperseg = int(min(T, fs)) if nperseg is None else nperseg
+    noverlap = nperseg // 2 if noverlap is None else noverlap
+
     freqs = None
-    P = np.empty((E, C, 0), np.float32)
-    for e in range(E):
-        Pc = []
-        for c in range(C):
-            f, pxx = welch(X[e, :, c], fs=fs, nperseg=nperseg, noverlap=noverlap, detrend="constant", scaling="density")
-            Pc.append(pxx.astype(np.float32))
-        Pc = np.stack(Pc, 0)
-        if freqs is None: freqs = f.astype(np.float32)
-        if e == 0: P = np.empty((E, C, len(freqs)), np.float32)
-        P[e] = Pc
-    if log: P = np.log(P + eps)
-    imgs = np.transpose(P, (0, 2, 1))  # (E, F, C)
-    imgs = imgs[..., None]             # (E, F, C, 1)
-    return imgs, freqs
+    P = None
+    for c in range(C):
+        f, pxx = welch(
+            epoch_tc[:, c],
+            fs=fs,
+            nperseg=nperseg,
+            noverlap=noverlap,
+            detrend="constant",
+            scaling="density",
+        )
+        if freqs is None:
+            freqs = f.astype(np.float32, copy=False)
+            P = np.empty((C, len(freqs)), dtype=np.float32)
+        P[c] = pxx.astype(np.float32, copy=False)
 
-def bcic_psd(batch_size, fs=100, pre_seconds=4, data_dir="data/concatenated_eeg", test_size=0.2, seed=0):
-    data_path = f"{data_dir}/combined_eeg_data.csv"
-    labels_path = f"{data_dir}/combined_labels.csv"
+    if log:
+        P = np.log(P + eps, dtype=np.float32)
 
-    training_data = pd.read_csv(data_path).astype(np.float32)
-    labels = pd.read_csv(labels_path, dtype={0: np.int32, 1: np.int32})
+    img = np.transpose(P, (1, 0))[:, :, None].astype(out_dtype, copy=False)
+    return img, freqs
 
-    X, y = _build_epochs(labels, training_data, fs=fs, pre_seconds=pre_seconds)
-    X, _ = _psd_cube(X, fs=fs, log=True)
 
+class _BatchStream:
+    def __init__(
+        self,
+        data_path: str,
+        labels_df: pd.DataFrame,
+        indices: np.ndarray,
+        batch_size: int,
+        fs: int,
+        pre_seconds: int,
+        channels: Optional[List[int]],
+        shuffle: bool,
+        seed: int,
+        psd_nperseg: Optional[int] = None,
+        psd_noverlap: Optional[int] = None,
+    ):
+        self.data_path = data_path
+        self.labels_df = labels_df
+        self.indices = np.array(indices, dtype=np.int64)
+        self.batch_size = len(indices) if batch_size == -1 else int(batch_size)
+        self.fs = fs
+        self.pre_seconds = pre_seconds
+        self.channels = channels
+        self.shuffle = shuffle
+        self.seed = seed
+        self.psd_nperseg = psd_nperseg
+        self.psd_noverlap = psd_noverlap
+        self._rng = np.random.default_rng(seed)
+        self.reset()
+
+    def reset(self):
+        self._order = np.arange(len(self.indices))
+        if self.shuffle:
+            self._rng.shuffle(self._order)
+        self._ptr = 0
+
+    def __iter__(self):
+        self.reset()
+        return self
+
+    def __len__(self):
+        return math.ceil(len(self.indices) / self.batch_size)
+
+    def __next__(self) -> Dict[str, np.ndarray]:
+        if self._ptr >= len(self._order):
+            raise StopIteration
+        j = self._order[self._ptr : self._ptr + self.batch_size]
+        self._ptr += self.batch_size
+        take = self.indices[j]
+
+        X_list, y_list = [], []
+        win = int(self.pre_seconds * self.fs)
+
+        for idx in take:
+            end = int(self.labels_df.iloc[idx, 0])
+            lab = int(self.labels_df.iloc[idx, 1])
+            start = end - win
+            if start < 0:
+                continue
+
+            epoch_tc = _epoch_slice_from_csv(
+                self.data_path, start=start, end=end, usecols=self.channels, dtype=np.float16
+            )
+            if epoch_tc.shape[0] != win:
+                continue
+
+            img, _ = _psd_image_from_epoch(
+                epoch_tc.astype(np.float32, copy=False),
+                fs=self.fs,
+                nperseg=self.psd_nperseg,
+                noverlap=self.psd_noverlap,
+                log=True,
+                eps=1e-8,
+                out_dtype=np.float16,
+            )
+            X_list.append(img)
+            y_list.append(lab)
+
+        if not X_list:
+            return self.__next__()
+
+        Xb = np.stack(X_list, axis=0)
+        yb = _label_to01(np.array(y_list, dtype=np.int8))
+        return {"image": Xb, "label": yb}
+
+
+def bcic_psd(
+    batch_size: int,
+    fs: int = 100,
+    pre_seconds: int = 4,
+    data_dir: str = "data/concatenated_eeg",
+    test_size: float = 0.2,
+    seed: int = 0,
+    channels: Optional[List[int]] = None,
+) -> Tuple[_BatchStream, _BatchStream, Dict[str, object]]:
+    data_path = os.path.join(data_dir, "combined_eeg_data.csv")
+    labels_path = os.path.join(data_dir, "combined_labels.csv")
+
+    labels_df = _read_labels(labels_path)
+    if len(labels_df) == 0:
+        raise ValueError("No {-1,+1} labels found.")
+
+    _, n_channels = _read_header_and_dims(data_path)
+    if channels is None:
+        channels = list(range(n_channels))
+
+    win = int(pre_seconds * fs)
+    sim_epoch = np.zeros((win, len(channels)), dtype=np.float32)
+    sim_img, freqs = _psd_image_from_epoch(sim_epoch, fs=fs, log=True)
+    F, C, _ = sim_img.shape
+    input_shape = (F, C, 1)
+
+    y01 = _label_to01(labels_df["label"].to_numpy())
     sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-    (tr_idx, te_idx), = sss.split(np.zeros(len(y)), y)
-    Xtr, Xte = X[tr_idx], X[te_idx]
-    ytr, yte = y[tr_idx], y[te_idx]
+    (tr_idx, te_idx), = sss.split(np.zeros_like(y01), y01)
 
-    full_batch = batch_size == -1
-    tr_iter = _Stream(Xtr, ytr, batch_size, shuffle=True, seed=seed)
-    te_iter = _Stream(Xte, yte, batch_size, shuffle=False, seed=seed)
+    tr_stream = _BatchStream(
+        data_path=data_path,
+        labels_df=labels_df,
+        indices=tr_idx,
+        batch_size=batch_size,
+        fs=fs,
+        pre_seconds=pre_seconds,
+        channels=channels,
+        shuffle=True,
+        seed=seed,
+    )
+    te_stream = _BatchStream(
+        data_path=data_path,
+        labels_df=labels_df,
+        indices=te_idx,
+        batch_size=batch_size,
+        fs=fs,
+        pre_seconds=pre_seconds,
+        channels=channels,
+        shuffle=False,
+        seed=seed,
+    )
 
-    meta = {
-        "n_train": len(ytr),
-        "n_test": len(yte),
-        "steps_per_epoch": 1 if full_batch else len(tr_iter),
-        "img_shape": (X.shape[1], X.shape[2], 1),  # (freq_bins, channels, depth)
-        "n_classes": 3,
+    meta: Dict[str, object] = {
+        "n_train": int(len(tr_idx)),
+        "n_test": int(len(te_idx)),
+        "steps_per_epoch": 1 if batch_size == -1 else len(tr_stream),
+        "n_classes": 2,
+        "input_shape": input_shape,
+        "fs": fs,
+        "pre_seconds": pre_seconds,
+        "channels_used": channels,
+        "freq_bins": len(freqs),
     }
-
-    return tr_iter, te_iter, meta
+    return tr_stream, te_stream, meta

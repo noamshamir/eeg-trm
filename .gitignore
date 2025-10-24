@@ -11,5 +11,5 @@ wheels/
 .venv
 
 #data
-data/concatenated_eeg/
+data/concatenated_eeg/combined_eeg_data.csv
 data/raw_eeg/

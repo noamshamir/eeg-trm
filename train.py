@@ -40,7 +40,7 @@ def main(args):
     n_inputs = next(train_data)["image"].shape[1:]
     train_data.reset()
     
-    n_classes = 10 if args.dataset in ["mnist", "cifar10"] else meta.get("n_classes", 3)
+    n_classes = 10 if args.dataset in ["mnist", "cifar10"] else meta.get("n_classes", 2)
 
     config = trm.ModelConfig(
         in_channels=n_inputs[-1],
