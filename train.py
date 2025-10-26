@@ -21,7 +21,8 @@ parser.add_argument("-e", "--epochs", type=int, default=15, help="number of epoc
 parser.add_argument("--lr", type=float, default=3e-4, help="learning rate")
 parser.add_argument("--seed", type=int, default=0, help="random seed")
 parser.add_argument("--cpu", action="store_true", help="use cpu only")
-
+parser.add_argument("--clean", action="store_true",
+                    help="Apply EEG preprocessing (bandpass + normalization)")
 
 def main(args):
     if args.cpu:
@@ -33,10 +34,14 @@ def main(args):
     elif args.dataset == "cifar10":
         train_data, test_data, meta = cifar10(args.batch_size)
     elif args.dataset == "eeg":
-        train_data, test_data, meta = bcic_psd(args.batch_size) 
-
-    else:
-        raise NotImplementedError(f"{args.dataset=} is not implemented.")
+        if args.clean:
+            train_data, test_data, meta = bcic_psd(
+                args.batch_size,
+                bandpass=(8, 30),
+                norm_mode="mad",
+            )
+        else:
+            train_data, test_data, meta = bcic_psd(args.batch_size)
     n_inputs = next(train_data)["image"].shape[1:]
     train_data.reset()
     

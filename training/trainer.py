@@ -123,6 +123,11 @@ class Trainer:
                 )
 
             epoch_bar.set_postfix(postfix)
+            print(
+                f"Train acc: {self.train_acc_trace[-1]*100:.2f}%"
+                + (f" | Val acc: {self.val_acc_trace[-1]*100:.2f}%" if val is not None else "")
+            )
+
 
     def evaluate(self, test):
         self.model.eval()

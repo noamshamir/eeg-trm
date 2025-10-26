@@ -5,10 +5,11 @@ from typing import List, Optional, Tuple, Dict
 
 import numpy as np
 import pandas as pd
-from scipy.signal import welch
+from scipy.signal import welch, butter, iirnotch, sosfiltfilt
 from sklearn.model_selection import StratifiedShuffleSplit
 
 
+# ---------- I/O ----------
 def _read_header_and_dims(data_path: str) -> Tuple[int, int]:
     one = pd.read_csv(data_path, nrows=1)
     with open(data_path, "r") as f:
@@ -51,6 +52,73 @@ def _epoch_slice_from_csv(
     return df.to_numpy(dtype=dtype, copy=False)
 
 
+# ---------- Preprocessing ----------
+def _sos_bandpass(fs: int, lo: float, hi: float, order: int = 4):
+    nyq = 0.5 * fs
+    lo, hi = max(1e-6, lo / nyq), min(0.999999, hi / nyq)
+    return butter(order, [lo, hi], btype="band", output="sos")
+
+
+def _sos_notch(fs: int, freq: float, q: float = 30.0):
+    if freq is None or freq <= 0:
+        return None
+    w0 = freq / (fs / 2.0)
+    if w0 <= 0 or w0 >= 1:
+        return None
+    b, a = iirnotch(w0, q)
+    # Convert (b,a) to sos using butter equivalence for stability
+    # Minimal 2nd-order section:
+    sos = np.zeros((1, 6), dtype=np.float64)
+    sos[0, :3] = b
+    sos[0, 3:] = a
+    return sos
+
+
+def _apply_filters(epoch_tc_f32: np.ndarray, fs: int,
+                   bandpass: Optional[Tuple[float, float]],
+                   notch_hz: Optional[float]) -> np.ndarray:
+    X = epoch_tc_f32
+    if notch_hz:
+        sos_n = _sos_notch(fs, notch_hz)
+        if sos_n is not None:
+            for c in range(X.shape[1]):
+                X[:, c] = sosfiltfilt(sos_n, X[:, c])
+    if bandpass:
+        lo, hi = bandpass
+        sos_b = _sos_bandpass(fs, lo, hi, order=4)
+        for c in range(X.shape[1]):
+            X[:, c] = sosfiltfilt(sos_b, X[:, c])
+    return X
+
+
+def _normalize_epoch(epoch_tc_f32: np.ndarray, mode: str = "mad") -> np.ndarray:
+    X = epoch_tc_f32
+    if mode == "zscore":
+        mu = np.mean(X, axis=0, dtype=np.float32)
+        sd = np.std(X, axis=0, ddof=1, dtype=np.float32)
+        sd[sd < 1e-6] = 1.0
+        X = (X - mu) / sd
+    else:  # "mad" (robust)
+        med = np.median(X, axis=0)
+        mad = np.median(np.abs(X - med), axis=0)
+        mad[mad < 1e-6] = 1.0
+        X = (X - med) / mad
+    return X
+
+
+def _artifact_ok(epoch_tc_f32: np.ndarray,
+                 abs_max: Optional[float],
+                 z_max: Optional[float]) -> bool:
+    if abs_max is not None and np.max(np.abs(epoch_tc_f32)) > abs_max:
+        return False
+    if z_max is not None:
+        z = (epoch_tc_f32 - epoch_tc_f32.mean(0)) / (epoch_tc_f32.std(0, ddof=1) + 1e-6)
+        if np.max(np.abs(z)) > z_max:
+            return False
+    return True
+
+
+# ---------- PSD ----------
 def _psd_image_from_epoch(
     epoch_tc: np.ndarray,
     fs: int,
@@ -87,6 +155,7 @@ def _psd_image_from_epoch(
     return img, freqs
 
 
+# ---------- Streaming ----------
 class _BatchStream:
     def __init__(
         self,
@@ -101,6 +170,11 @@ class _BatchStream:
         seed: int,
         psd_nperseg: Optional[int] = None,
         psd_noverlap: Optional[int] = None,
+        bandpass: Optional[Tuple[float, float]] = None,
+        notch_hz: Optional[float] = None,
+        norm_mode: Optional[str] = None,
+        artifact_abs_max: Optional[float] = None,
+        artifact_z_max: Optional[float] = None,
     ):
         self.data_path = data_path
         self.labels_df = labels_df
@@ -113,6 +187,11 @@ class _BatchStream:
         self.seed = seed
         self.psd_nperseg = psd_nperseg
         self.psd_noverlap = psd_noverlap
+        self.bandpass = bandpass
+        self.notch_hz = notch_hz
+        self.norm_mode = norm_mode
+        self.artifact_abs_max = artifact_abs_max
+        self.artifact_z_max = artifact_z_max
         self._rng = np.random.default_rng(seed)
         self.reset()
 
@@ -152,14 +231,19 @@ class _BatchStream:
             if epoch_tc.shape[0] != win:
                 continue
 
+            Xf = epoch_tc.astype(np.float32, copy=False)
+            if self.bandpass or self.notch_hz:
+                Xf = _apply_filters(Xf, self.fs, self.bandpass, self.notch_hz)
+            if self.norm_mode:
+                Xf = _normalize_epoch(Xf, self.norm_mode)
+            if not _artifact_ok(Xf, self.artifact_abs_max, self.artifact_z_max):
+                continue
+
             img, _ = _psd_image_from_epoch(
-                epoch_tc.astype(np.float32, copy=False),
-                fs=self.fs,
+                Xf, fs=self.fs,
                 nperseg=self.psd_nperseg,
                 noverlap=self.psd_noverlap,
-                log=True,
-                eps=1e-8,
-                out_dtype=np.float16,
+                log=True, eps=1e-8, out_dtype=np.float16,
             )
             X_list.append(img)
             y_list.append(lab)
@@ -172,6 +256,7 @@ class _BatchStream:
         return {"image": Xb, "label": yb}
 
 
+# ---------- Public API ----------
 def bcic_psd(
     batch_size: int,
     fs: int = 100,
@@ -180,7 +265,15 @@ def bcic_psd(
     test_size: float = 0.2,
     seed: int = 0,
     channels: Optional[List[int]] = None,
-) -> Tuple[_BatchStream, _BatchStream, Dict[str, object]]:
+    # new preprocessing toggles (all optional; default off/backward-compatible)
+    bandpass: Optional[Tuple[float, float]] = None,   # e.g., (8, 30)
+    notch_hz: Optional[float] = None,                 # e.g., 60 or 50
+    norm_mode: Optional[str] = None,                  # "mad" | "zscore" | None
+    artifact_abs_max: Optional[float] = None,         # e.g., 300.0 (µV-equivalent units)
+    artifact_z_max: Optional[float] = None,           # e.g., 6.0
+    psd_nperseg: Optional[int] = None,
+    psd_noverlap: Optional[int] = None,
+) -> Tuple["_BatchStream", "_BatchStream", Dict[str, object]]:
     data_path = os.path.join(data_dir, "combined_eeg_data.csv")
     labels_path = os.path.join(data_dir, "combined_labels.csv")
 
@@ -199,8 +292,9 @@ def bcic_psd(
     input_shape = (F, C, 1)
 
     y01 = _label_to01(labels_df["label"].to_numpy())
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-    (tr_idx, te_idx), = sss.split(np.zeros_like(y01), y01)
+    (tr_idx, te_idx), = StratifiedShuffleSplit(
+        n_splits=1, test_size=test_size, random_state=seed
+    ).split(np.zeros_like(y01), y01)
 
     tr_stream = _BatchStream(
         data_path=data_path,
@@ -212,6 +306,13 @@ def bcic_psd(
         channels=channels,
         shuffle=True,
         seed=seed,
+        psd_nperseg=psd_nperseg,
+        psd_noverlap=psd_noverlap,
+        bandpass=bandpass,
+        notch_hz=notch_hz,
+        norm_mode=norm_mode,
+        artifact_abs_max=artifact_abs_max,
+        artifact_z_max=artifact_z_max,
     )
     te_stream = _BatchStream(
         data_path=data_path,
@@ -223,6 +324,13 @@ def bcic_psd(
         channels=channels,
         shuffle=False,
         seed=seed,
+        psd_nperseg=psd_nperseg,
+        psd_noverlap=psd_noverlap,
+        bandpass=bandpass,
+        notch_hz=notch_hz,
+        norm_mode=norm_mode,
+        artifact_abs_max=artifact_abs_max,
+        artifact_z_max=artifact_z_max,
     )
 
     meta: Dict[str, object] = {
